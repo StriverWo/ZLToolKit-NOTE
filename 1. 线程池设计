@@ -1,0 +1,309 @@
+# 线程池设计
+## 整体设计
+```cpp
+
+class ThreadPool {
+public:
+    enum Priority{
+        // 5种级别的线程优先性
+        PRIORITY_LOWEST = 0,
+        PRIORITY_LOW,
+        PRIORITY_NORMA,
+        PRIORITY_HIGH,
+        PRIORITY_HIGHEST
+    };
+
+    // 构造函数比较复杂，但我们首先能知道的肯定是在其中初始化了诸如线程池中的线程个数，并将其挂载到run函数上执行
+    ThreadPool(int num = 1, Priority priority = PRIORITY_HIGHEST, bool auto_run = true, bool set_affinity = true, 
+               const std::string& pool_name = "thread pool") {
+        _thread_num = num;
+        // 定义匿名函数，通过此函数线程可以配置相关信息
+        _on_setup = [pool_name, priority, set_affinity](int index) {
+            std::string name = pool_name + ' ' + std::to_string(index);
+            setPriority(priority);  // 设置线程优先级
+            setThreadName(name.data()); // 设置线程名称
+            if(set_affinity) {
+                setThreadAffinity(index % std::thread::hardware_concurrency());    // 设置线程亲和性
+            }
+        };
+        //日志记录？？？
+
+        if(auto_run) {
+            start(); // 分配线程
+        }
+    }
+    // 析构函数：清空任务队列中等待执行的所有任务（并不是名义上的清空，而是唤醒进程去执行完这些任务）；然后等待线程执行结束
+    ~ThreadPool() {
+        shutdown();
+        wait();
+    }
+
+    // 将任务打入任务队列(线程池)中并异步执行
+    Task::Ptr async(TaskIn task, bool may_sync = true) {
+        if(may_sync && _thread_group.is_this_thread_in()){
+            task();
+        }
+        // 加入任务队列中
+        /** task是TaskIn类型，即std::function<void()> **/
+        auto ret = std::make_shared<Task>(std::move(task)); //通过move函数将task转换为右值，避免多余的拷贝
+        _queue.push_task(ret);
+        return ret;
+    }
+    
+private:
+    // 线程池中所有线程闲置时的挂载函数
+    void run(size_t index) {
+        //根据传入的线程索引index对线程进行配置（设置优先性、线程名称、线程亲和性等）。
+        _on_setup(index);
+        Task::Ptr task;     //存储从任务队列中得到的任务（是个智能指针，管理Task对象）
+        while(true) {
+            if(!_queue.get_task(task)) {
+                // 任务队列为空，退出线程
+                break;
+            }
+            
+            try {
+                (*task)();  //执行任务，task是个智能指针，*task是TaskCancelableImp对象实体，实际上调用的是该类中重载后的()运算符
+                task = nullptr; //任务执行完毕，指针置空，即释放其所管理的任务资源。
+            } catch (std::exception& ex) {
+                // 抛出异常
+            }
+        }
+    }
+
+    void start() {
+        if(_thread_num <= 0){
+            return;
+        }
+        size_t total = _thread_num - _thread_group.size();  // 还需要创建的线程数目
+        // 挂载线程到run函数:实际上挂载到的是一个函数体内包含run函数的匿名函数
+        for(size_t i = 0; i < total; i++) {
+            _thread_group.create_thead([this, i]() {run(i);});
+        }
+    }
+
+    // 设置线程优先级
+    // 在C++11标准中，std::thread类库提供了一种简单的创建线程的方法，但并未提供直接修改线程调度策略和优先级的方法。
+    // 如果需要修改线程的调度策略和优先级，可以使用pthread库中的函数
+    static bool setPriority(Priority priority, std::thread::native_handle_type threadID = 0) {
+      //linux/Unix实现
+        int policy = SCHED_FIFO;    //调度策略
+        // 获得最小和最大优先级值
+        static int Min = sched_get_priority_min(policy);
+        static int Max = sched_get_priority_max(policy);
+        if(Min < 0 || Max < 0){
+            return false;
+        }
+        // 优先级映射数组定义
+        static int Priorities[] = {Min, Min + (Max - Min) /4, Min + (Max - Min) /2, Min + (Max - Min) * 3/4, Max};
+        // 线程ID处理及参数设置
+        if(threadID == 0){
+            threadID = pthread_self();
+        }
+        struct sched_param params;
+        params.sched_priority = Priorities[priority];
+        // 设置优先级操作及返回值判断
+        return pthread_setschedparam(threadID, policy, &params) == 0;
+    }
+
+    void shutdown() {
+        _queue.push_exit(_thread_num);  //清空任务
+    }
+
+    void wait() {
+        _thread_group.join_all();   // 等待
+    }
+
+    size_t _thread_num;     // 当前线程池中的线程个数
+    thread_group _thread_group; //线程池中的线程
+    /*****************************************************************************************************
+     * 任务队列的实现在TaskQueue.h的头文件中，任务可以等价于一个例程（函数）；
+     * 使用C++11引入的std::function对象对这样的例程进行包装（封装），它能够统一处理如函数、函数指针、lamb函数等；
+     * 使用智能指针进一步对std::function对象进行管理，这个智能指针封装在Task对象中；
+     * 为了实现“可取消的任务”的抽象，还需要进一步考虑强弱引用的问题
+     * 
+    ******************************************************************************************************/
+    TaskQueue<Task::Ptr> _queue;   // 任务队列，每个元素存储的是智能指针对象
+    std::function<void(int)> _on_setup;     // 封装了一个对线程配置的函数
+};
+
+```
+从整体看使用时直接构造 ThreadPool 对象即可。
+
+有任务时，主线程只需异步将该任务打入到任务队列中即可。 队列中封装了任务的打入、取出等逻辑。
+
+初始构造ThreadPool 对象的时候就会根据传入参数构造多个线程，实际上创造线程的过程发生在上述的 start 函数中，且在 start 函数中已经确认了线程池中线程默认的挂载点（函数）就是 成员函数 run 。
+
+```cpp
+// 线程池中所有线程闲置时的挂载函数
+    void run(size_t index) {
+        //根据传入的线程索引index对线程进行配置（设置优先性、线程名称、线程亲和性等）。
+        _on_setup(index);
+        Task::Ptr task;     //存储从任务队列中得到的任务（是个智能指针，管理Task对象）
+        while(true) {
+            if(!_queue.get_task(task)) {
+                // 任务队列为空，退出线程
+                break;
+            }
+            
+            try {
+                (*task)();  //执行任务，task是个智能指针，*task是TaskCancelableImp对象实体，实际上调用的是该类中重载后的()运算符
+                task = nullptr; //任务执行完毕，指针置空，即释放其所管理的任务资源。
+            } catch (std::exception& ex) {
+                // 抛出异常
+            }
+        }
+    }
+```
+
+## 线程组设计
+
+```cpp
+// 实现线程组的结构
+
+class thread_group {
+public:
+    // 构造函数
+    thread_group() {}
+    /* ------------------------------------------------------------------------
+     *  禁止使用默认的拷贝构造和拷贝赋值的构造函数
+     *  在C++11之前，可以将其声明为private权限的成员方法，这样也可以起到类似的效果如：
+     *  可以参照Effective C++书籍中的构造函数初始化的部分；
+     *  C++11引入的delete机制，用于明确禁止某些操作或函数的使用；
+     *  因为编译器会自动生成拷贝构造和拷贝赋值的构造函数，所以这里必须要明确将他们设置为delete
+     * -------------------------------------------------------------------  *///  
+    thread_group(const thread_group &) = delete;
+    thread_group &operator=(const thread_group &) =  delete;
+    ~thread_group() {
+        //析构函数中需要释放掉所有的线程对象，而在该类中用哈希表组织维护线程，这里只需要清除哈希表即可
+        //清除哈希表的过程会自动调用智能指针的析构函数，从而释放掉智能指针所管理的线程资源
+        _thread.clear();
+    }
+
+    // 创建线程
+    /**------------------------------------------------------------------------
+     * 线程需要执行相应的逻辑，也就是线程需要挂载到一个具体的工作任务上；
+     * 线程池中线程初始时并没有实际任务需要去处理，但并不能终止，否则就不是线程池了；
+     * 所以这里创建的线程需要挂载到一个循环等待的函数中，等待任务的到来进而唤醒线程执行
+     * 
+     * 但这里为了灵活性，使用模板函数的方法用于创建线程。
+     * 创建线程首先需要创建一个线程对象：
+     * std:thread raw_thread = new std::thread(std::forward<F>(threadFun));
+     * 为了方便管理，减少内存泄漏的可能，使用智能指针来管理这个线程对象
+     * std::share_ptr new_thread(raw_thread);
+     * 然后将相应的thread_id和这个管理线程对象的智能指针保存至哈希表中即可。
+     * 
+     * 什么叫做万能引用？？？完美转发？？？这里还需要再学习
+    **---------------------------------------------------------------------*/
+    template<typename F>
+    std::thread *create_thead(F&& threadfunc) {
+        auto thread_new = std::make_shared<std::thread>(std::forward<F>(threadfunc));
+        _thread_id = thread_new->get_id();
+        _thread[_thread_id] = thread_new;
+        return thread_new.get();  // 返回线程的裸指针，线程对象的生命周期仍由 std::shared_ptr 管理，但通过裸指针可以实现直接操作线程（如 join 或 detach）
+    }
+
+    // 从线程组中移除某个线程
+    void remove_thread(std::thread *thrd){
+        auto it = _thread.find(thrd->get_id());
+        if(it != _thread.end()){
+            _thread.erase(it);
+        }
+    }
+    
+    // 判断当前线程是否就在线程池中
+    bool is_this_thread_in() {
+        auto cur_thread_id = std::this_thread::get_id();
+        if(_thread_id == cur_thread_id){
+            return true;
+        }
+        return _thread.find(cur_thread_id)!=_thread.end();
+    }
+
+    // 等待线程组中的所有线程都执行完毕
+    void join_all() {
+        // 需要避免线程池中的线程自己调用join_all函数，否则会造成死锁，自己等待自己执行结束
+        // 故需要预先判断调用join_all函数的线程是否就在线程池中，这个功能交由is_this_thread_in()完成
+        if(is_this_thread_in()){
+            throw std::runtime_error("Try joining itself in thread_group.");
+        }
+        // 等待线程池中的所有线程执行完毕
+        for(auto& it : _thread) {
+            if(it.second->joinable()){
+                // 需要预先判断线程是否可以调用join函数
+                it.second->join();  // 等待线程主动退出
+            }
+        }
+        _thread.clear();    // 释放所有的线程对象所占资源（空间）
+    }
+
+    // 统计线程池中线程数量
+    size_t size() {
+        return _thread.size();
+    }
+
+private:
+    std::thread::id _thread_id;     //当前线程的id
+    // 用哈希表来存储相应的线程，键是线程的id，值是管理线程对象的一个智能指针share_ptr
+    std::unordered_map<std::thread::id, std::shared_ptr<std::thread>> _thread;
+};
+```
+## 任务队列设计
+```cpp
+TaskQueue<Task::Ptr> _queue;   // 任务队列，每个元素存储的是智能指针对象实际上
+```
+这里实际上最后是：Task封装了 std::function 对象，且用智能指针管理该对象资源。Ptr是内嵌声明。
+```cpp
+
+template<typename T>
+class TaskQueue {
+public:
+    // 这里使用编译器自动生成的默认构造、拷贝构造、拷贝赋值构造三种构造函数方式
+    //(1)将任务加入队列中
+    template<typename FUNC>
+    void push_task(FUNC&& task_fun) {
+        {
+            // 使用C++11引入的资源获取即初始化RAII类型：std::lock_guard,用于简化互斥量的使用
+            // 以对象来管理资源
+            // 构造时自动锁定互斥量，析构时自动解锁，确保线程安全
+            // 对象构造在栈区，离开作用域后会自动调用对象的析构函数进行资源的释放（这里是解锁）
+            std::lock_guard<decltype(_mutex)> lock(_mutex); //decltype<_mutex>用于自动推导出_mutex的类型，因为他不一定是std:mutex类型
+            _queue.emplace_back(std::forward<FUNC>(task_fun));
+            // 这里需要尽量以emplace_back代替push_back，这也是C++11引入的，避免了拷贝构造或者移动构造
+        }        
+        // 在任务队列中加入一个任务后，唤醒一个线程去处理
+        // 如何唤醒，这就涉及信号量的问题
+        _sem.post();
+    }
+    //(2)从队列中返回任务
+    /****************************************************************************
+     * 构造包含一定数量线程的线程池对象后，这些线程会循环的等待任务队列中任务的加入；
+     * 从而进一步返回队列首部任务，供给给其中一个线程以执行；
+     * 循环等待的这个过程实质上就在threadPool类中的一个私有成员函数run中即可实现；
+     * 在TaskQueue类中，这里要做的任务仅仅是任务队列中有任务时，返回这个任务即可
+     ****************************************************************************/
+    bool get_task(T& task){
+        _sem.wait();
+        std::lock_guard<decltype(_mutex)> lock(_mutex);
+        if(_queue.empty()){
+            return false;
+        }
+        task = std::move(_queue.front());   
+        _queue.pop_front();
+        return true;
+    }
+
+    // 清空任务队列
+    void push_exit(size_t n) {
+        _sem.post(n);
+    }
+private:
+    List <T> _queue;     //任务的载体队列
+    mutable std::mutex _mutex;  //互斥量
+    semaphore _sem;      //信号量
+}
+```
+
+
+
+
